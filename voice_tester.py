@@ -39,6 +39,36 @@ except ImportError:
     PEDALBOARD_OK = False
 
 # ─────────────────────────────────────────────
+#  OPTIONAL: KOKORO TTS  (pip install kokoro soundfile)
+# ─────────────────────────────────────────────
+
+try:
+    from kokoro import KPipeline as _KokoroPipeline
+    import numpy as _np
+    import soundfile as _sf
+    KOKORO_OK = True
+except ImportError:
+    KOKORO_OK = False
+
+KOKORO_VOICES = [
+    # American English — Female
+    "af_heart", "af_bella", "af_nicole", "af_aoede",
+    "af_kore",  "af_sarah", "af_sky",
+    # American English — Male
+    "am_adam",  "am_echo",  "am_eric",  "am_fenrir",
+    "am_liam",  "am_michael", "am_onyx", "am_puck",
+    # British English — Female
+    "bf_alice", "bf_emma",  "bf_isabella", "bf_lily",
+    # British English — Male
+    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+    # French
+    "ff_siwis",
+]
+
+# One pipeline instance per lang_code — avoids reloading the model every call
+_kokoro_pipeline_cache: dict = {}
+
+# ─────────────────────────────────────────────
 #  COLOURS
 # ─────────────────────────────────────────────
 
@@ -318,6 +348,43 @@ def enhance_pedalboard(input_path: str, output_path: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def wav_to_mp3(wav: str, mp3: str) -> tuple[bool, str]:
+    """Convert a WAV file to MP3 using FFmpeg."""
+    cmd = ["ffmpeg", "-y", "-i", wav, "-b:a", "192k", "-loglevel", "error", mp3]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=30)
+        if r.returncode == 0:
+            return True, "converted"
+        return False, r.stderr.decode()[:120]
+    except FileNotFoundError:
+        return False, "FFmpeg not found"
+    except subprocess.TimeoutExpired:
+        return False, "FFmpeg timed out"
+
+
+def _run_kokoro(text: str, voice: str, speed: float, wav_path: str):
+    """
+    Generate audio with Kokoro TTS (synchronous, call from worker thread).
+    Saves 24 kHz mono float32 WAV.  Reuses pipeline instance per language.
+    """
+    if not KOKORO_OK:
+        raise RuntimeError("Kokoro not installed — run: pip install kokoro soundfile")
+    lang_code = voice[0]  # 'a'=American, 'b'=British, 'f'=French, …
+    if lang_code not in _kokoro_pipeline_cache:
+        _kokoro_pipeline_cache[lang_code] = _KokoroPipeline(lang_code=lang_code)
+    pipeline = _kokoro_pipeline_cache[lang_code]
+    chunks = []
+    for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        if audio is not None:
+            chunks.append(audio)
+    if not chunks:
+        raise RuntimeError(
+            f"Kokoro returned no audio — check voice '{voice}' and internet connection"
+        )
+    audio = _np.concatenate(chunks)
+    _sf.write(wav_path, audio, 24000)
+
+
 # ─────────────────────────────────────────────
 #  AUDIO PANEL WIDGET
 # ─────────────────────────────────────────────
@@ -535,6 +602,7 @@ class VoiceTesterApp(tk.Tk):
             (" Windows MCI ✓ ", True),
             (" FFmpeg ✓ " if self._ffmpeg_ok else " FFmpeg ✗ ", self._ffmpeg_ok),
             (" Pedalboard ✓ " if PEDALBOARD_OK else " Pedalboard ✗ ", PEDALBOARD_OK),
+            (" Kokoro ✓ " if KOKORO_OK else " Kokoro ✗ ", KOKORO_OK),
         ]:
             tk.Label(title_row, text=txt,
                      bg=C["green"] if ok else C["yellow"], fg=C["bg"],
@@ -553,32 +621,45 @@ class VoiceTesterApp(tk.Tk):
         )
         self._textbox.pack(fill="x", pady=(2, 8))
         self._textbox.insert("1.0",
-            "Hello! This is a first test sentence. "
-            "Here comes a slightly longer second sentence. "
-            "And a third one to round things out nicely.")
+            "She whispered his name softly, gently taking his hand in hers. The room was warm and quiet, filled with the tender glow of candlelight. She smiled, tears running slowly down her cheeks."
+
+            "He wept alone in the empty corridor, grief tearing through him like a blade. The sorrow was unbearable, hopeless and heavy. He whispered a last farewell to the silence, knowing he would never return."
+
+            "The shadow crept slowly under the door. He waited, listening, watching every corner of the room. Something was wrong — he could feel it. The silence was too deep, the stillness too deliberate."
+
+            "Suddenly the door burst open. She gasped, her heart stopped. Terror flooded the room as darkness collapsed around them, blood pounding in her ears. He trembled, stunned, unable to move."
+
+            "He sprinted across the rooftop, leapt over the gap, crashed through the window and fought his way down the stairs. They chased him through the alley — he escaped by seconds, fired two shots behind him without looking back."
+
+            "They laughed and danced together in the street, delighted and thrilled by the wonderful news. It was an amazing, joyful evening — perfect in every way. He had never felt so happy, so alive.")
         self._textbox.bind("<Control-Return>", lambda _e: self._parse_and_load())
 
         # Controls row
         ctrl = tk.Frame(top, bg=C["bg"])
         ctrl.pack(fill="x")
 
-        tk.Label(ctrl, text="Voice:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._et_lbl_voice = tk.Label(ctrl, text="Voice:", bg=C["bg"], fg=C["text"])
+        self._et_lbl_voice.pack(side="left")
         self._voice_var = tk.StringVar(value="en-GB-RyanNeural")
-        ttk.Combobox(ctrl, textvariable=self._voice_var,
-                     values=VOICES, width=26, state="readonly"
-                     ).pack(side="left", padx=(4, 18))
+        self._et_voice_cb = ttk.Combobox(ctrl, textvariable=self._voice_var,
+                                         values=VOICES, width=26, state="readonly")
+        self._et_voice_cb.pack(side="left", padx=(4, 18))
 
-        tk.Label(ctrl, text="Rate:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._et_lbl_rate = tk.Label(ctrl, text="Rate:", bg=C["bg"], fg=C["text"])
+        self._et_lbl_rate.pack(side="left")
         self._rate_var = tk.StringVar(value="-5%")
-        tk.Entry(ctrl, textvariable=self._rate_var, width=6,
-                 bg=C["surface2"], fg=C["text"], insertbackground=C["text"],
-                 relief="flat").pack(side="left", padx=(4, 18))
+        self._et_rate_entry = tk.Entry(ctrl, textvariable=self._rate_var, width=6,
+                                       bg=C["surface2"], fg=C["text"],
+                                       insertbackground=C["text"], relief="flat")
+        self._et_rate_entry.pack(side="left", padx=(4, 18))
 
-        tk.Label(ctrl, text="Pitch:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._et_lbl_pitch = tk.Label(ctrl, text="Pitch:", bg=C["bg"], fg=C["text"])
+        self._et_lbl_pitch.pack(side="left")
         self._pitch_var = tk.StringVar(value="+0Hz")
-        tk.Entry(ctrl, textvariable=self._pitch_var, width=7,
-                 bg=C["surface2"], fg=C["text"], insertbackground=C["text"],
-                 relief="flat").pack(side="left", padx=(4, 18))
+        self._et_pitch_entry = tk.Entry(ctrl, textvariable=self._pitch_var, width=7,
+                                        bg=C["surface2"], fg=C["text"],
+                                        insertbackground=C["text"], relief="flat")
+        self._et_pitch_entry.pack(side="left", padx=(4, 18))
 
         # Smart Prosody toggle
         self._smart_var = tk.BooleanVar(value=True)
@@ -620,6 +701,49 @@ class VoiceTesterApp(tk.Tk):
             command=self._toggle_play_all,
         )
         self._play_all_btn.pack(side="left")
+
+        # ── Backend row ───────────────────────────────────────────
+        brow = tk.Frame(top, bg=C["bg"])
+        brow.pack(fill="x", pady=(6, 0))
+
+        tk.Label(brow, text="Backend:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._backend_var = tk.StringVar(value="edge")
+        tk.Radiobutton(
+            brow, text="Edge TTS",
+            variable=self._backend_var, value="edge",
+            bg=C["bg"], fg=C["text"], selectcolor=C["surface2"],
+            activebackground=C["bg"], activeforeground=C["text"],
+            command=self._on_backend_change,
+        ).pack(side="left", padx=(6, 12))
+        tk.Radiobutton(
+            brow, text="Kokoro TTS",
+            variable=self._backend_var, value="kokoro",
+            bg=C["bg"], fg=C["text"] if KOKORO_OK else C["dim"],
+            selectcolor=C["surface2"],
+            activebackground=C["bg"], activeforeground=C["text"],
+            state="normal" if KOKORO_OK else "disabled",
+            command=self._on_backend_change,
+        ).pack(side="left", padx=(0, 20))
+
+        tk.Label(brow, text="Kokoro Voice:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._kokoro_voice_var = tk.StringVar(value="af_heart")
+        self._kokoro_voice_cb = ttk.Combobox(
+            brow, textvariable=self._kokoro_voice_var,
+            values=KOKORO_VOICES, width=18, state="disabled",
+        )
+        self._kokoro_voice_cb.pack(side="left", padx=(4, 20))
+
+        tk.Label(brow, text="Speed:", bg=C["bg"], fg=C["text"]).pack(side="left")
+        self._speed_var = tk.StringVar(value="1.0")
+        self._speed_entry = tk.Entry(
+            brow, textvariable=self._speed_var, width=5,
+            bg=C["surface2"], fg=C["dim"],
+            insertbackground=C["text"], relief="flat", state="disabled",
+        )
+        self._speed_entry.pack(side="left", padx=(4, 0))
+        tk.Label(brow, text="  (0.5 – 2.0)",
+                 bg=C["bg"], fg=C["dim"], font=("Segoe UI", 8)
+                 ).pack(side="left")
 
         # ══ PARAGRAPH LIST ═══════════════════════════════════════
         mid = tk.Frame(self, bg=C["bg"], padx=16)
@@ -683,6 +807,22 @@ class VoiceTesterApp(tk.Tk):
         ).pack(fill="x", side="bottom")
 
     # ── Logic ─────────────────────────────────
+
+    def _on_backend_change(self):
+        is_kokoro = self._backend_var.get() == "kokoro"
+        # Edge TTS controls
+        et_state = "disabled" if is_kokoro else "normal"
+        et_cb_state = "disabled" if is_kokoro else "readonly"
+        self._et_voice_cb.config(state=et_cb_state)
+        self._et_rate_entry.config(state=et_state,
+                                   fg=C["dim"] if is_kokoro else C["text"])
+        self._et_pitch_entry.config(state=et_state,
+                                    fg=C["dim"] if is_kokoro else C["text"])
+        # Kokoro controls
+        ko_state = "readonly" if is_kokoro else "disabled"
+        self._kokoro_voice_cb.config(state=ko_state)
+        self._speed_entry.config(state="normal" if is_kokoro else "disabled",
+                                 fg=C["text"] if is_kokoro else C["dim"])
 
     def _parse_and_load(self):
         text = self._textbox.get("1.0", "end").strip()
@@ -751,36 +891,64 @@ class VoiceTesterApp(tk.Tk):
             self._status("Still generating — please wait a moment…")
             return
 
-        item   = self._items[idx]
-        text   = item["text"]
-        voice  = self._voice_var.get()
-        rate   = item["rate"]
-        pitch  = item["pitch"]
-        vol    = item["vol"]
+        item    = self._items[idx]
+        text    = item["text"]
         emotion = item["emotion"]
-        ffmpeg = self._ffmpeg_ok
-        total  = len(self._items)
+        rate    = item["rate"]
+        pitch   = item["pitch"]
+        vol     = item["vol"]
+        ffmpeg  = self._ffmpeg_ok
+        total   = len(self._items)
 
-        raw_path = os.path.join(self._tmpdir, f"s{idx}_raw.mp3")
-        enh_path = os.path.join(self._tmpdir, f"s{idx}_enh.mp3")
+        # Capture backend settings before spawning thread
+        backend   = self._backend_var.get()
+        voice_et  = self._voice_var.get()
+        voice_ko  = self._kokoro_voice_var.get()
+        try:
+            speed_ko = float(self._speed_var.get() or "1.0")
+        except ValueError:
+            speed_ko = 1.0
+
+        if backend == "kokoro":
+            vtag     = re.sub(r'[^\w]', '_', voice_ko)
+            raw_path = os.path.join(self._tmpdir, f"s{idx}_{vtag}_ko_raw.wav")
+            enh_path = os.path.join(self._tmpdir, f"s{idx}_{vtag}_ko_enh.mp3")
+            raw_label = f"{emotion}  ·  {voice_ko}  ·  speed {speed_ko:.1f}x"
+            self._status(
+                f"Generating {idx+1}/{total}  [Kokoro  {voice_ko}  {emotion}]…"
+            )
+        else:
+            vtag     = re.sub(r'[^\w]', '_', voice_et)
+            raw_path = os.path.join(self._tmpdir, f"s{idx}_{vtag}_raw.mp3")
+            enh_path = os.path.join(self._tmpdir, f"s{idx}_{vtag}_enh.mp3")
+            raw_label = f"{emotion}  ·  rate {rate}  ·  pitch {pitch}"
+            self._status(
+                f"Generating {idx+1}/{total}  [{emotion}  {rate}  {pitch}]…"
+            )
 
         self._raw_panel.set_loading("Generating TTS…")
         self._enh_panel.set_loading("Waiting for raw audio…")
-        self._status(f"Generating {idx + 1}/{total}  [{emotion}  {rate}  {pitch}]…")
-
-        # Build the label shown in the panel once ready
-        raw_label = f"{emotion}  ·  rate {rate}  ·  pitch {pitch}"
 
         def worker():
-            # 1 — TTS  (pass volume via edge-tts volume param)
-            try:
-                asyncio.run(_tts_async(text, voice, rate, pitch, raw_path, vol))
-            except Exception as exc:
-                err = str(exc)
-                self._post(lambda: self._raw_panel.set_error(err))
-                self._post(lambda: self._enh_panel.set_error("Skipped (TTS failed)"))
-                self._post(lambda: self._status(f"TTS error: {err}"))
-                return
+            # 1 — TTS
+            if backend == "kokoro":
+                try:
+                    _run_kokoro(text, voice_ko, speed_ko, raw_path)
+                except Exception as exc:
+                    err = str(exc)
+                    self._post(lambda: self._raw_panel.set_error(err))
+                    self._post(lambda: self._enh_panel.set_error("Skipped (TTS failed)"))
+                    self._post(lambda: self._status(f"Kokoro error: {err}"))
+                    return
+            else:
+                try:
+                    asyncio.run(_tts_async(text, voice_et, rate, pitch, raw_path, vol))
+                except Exception as exc:
+                    err = str(exc)
+                    self._post(lambda: self._raw_panel.set_error(err))
+                    self._post(lambda: self._enh_panel.set_error("Skipped (TTS failed)"))
+                    self._post(lambda: self._status(f"TTS error: {err}"))
+                    return
 
             self._post(lambda: self._raw_panel.set_ready_and_play(raw_path, raw_label))
 
@@ -836,9 +1004,15 @@ class VoiceTesterApp(tk.Tk):
         self._raw_panel.set_loading("Generating all paragraphs…")
         self._enh_panel.set_loading("Waiting for raw audio…")
 
-        voice  = self._voice_var.get()
-        ffmpeg = self._ffmpeg_ok
-        items  = list(self._items)
+        voice    = self._voice_var.get()
+        ffmpeg   = self._ffmpeg_ok
+        items    = list(self._items)
+        backend  = self._backend_var.get()
+        voice_ko = self._kokoro_voice_var.get()
+        try:
+            speed_ko = float(self._speed_var.get() or "1.0")
+        except ValueError:
+            speed_ko = 1.0
 
         def worker():
             import time
@@ -869,25 +1043,48 @@ class VoiceTesterApp(tk.Tk):
                 if self._play_all_stop.is_set():
                     break
                 self._post(lambda i=i: self._highlight_item(i))
-                self._post(lambda i=i: self._status(
-                    f"Generating {i+1}/{len(items)}  [{items[i]['emotion']}]…"
-                ))
-                # Include voice name in filename so changing voice invalidates cache
-                voice_tag = re.sub(r'[^\w]', '_', voice)
-                raw_path = os.path.join(self._tmpdir, f"s{i}_{voice_tag}_raw.mp3")
-                if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
-                    try:
-                        asyncio.run(_tts_async(
-                            item["text"], voice,
-                            item["rate"], item["pitch"], raw_path, item["vol"]
-                        ))
-                    except Exception as exc:
-                        self._post(lambda e=str(exc): self._status(f"TTS error: {e}"))
-                        self._post(lambda: self._raw_panel.set_error("TTS failed"))
-                        self._post(lambda: self._enh_panel.set_error("Skipped"))
-                        self._post(lambda: self._reset_play_all_btn())
-                        return
-                raw_paths.append(raw_path)
+                if backend == "kokoro":
+                    self._post(lambda i=i: self._status(
+                        f"Generating {i+1}/{len(items)}  [Kokoro  {items[i]['emotion']}]…"
+                    ))
+                    vtag     = re.sub(r'[^\w]', '_', voice_ko)
+                    wav_path = os.path.join(self._tmpdir, f"s{i}_{vtag}_ko_raw.wav")
+                    if not (os.path.exists(wav_path) and os.path.getsize(wav_path) > 0):
+                        try:
+                            _run_kokoro(item["text"], voice_ko, speed_ko, wav_path)
+                        except Exception as exc:
+                            self._post(lambda e=str(exc): self._status(f"Kokoro error: {e}"))
+                            self._post(lambda: self._raw_panel.set_error("Kokoro TTS failed"))
+                            self._post(lambda: self._enh_panel.set_error("Skipped"))
+                            self._post(lambda: self._reset_play_all_btn())
+                            return
+                    # Convert WAV → MP3 so the concat/enhance pipeline stays uniform
+                    if ffmpeg:
+                        mp3_path = os.path.join(self._tmpdir, f"s{i}_{vtag}_ko_raw.mp3")
+                        if not (os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0):
+                            wav_to_mp3(wav_path, mp3_path)
+                        raw_paths.append(mp3_path)
+                    else:
+                        raw_paths.append(wav_path)
+                else:
+                    self._post(lambda i=i: self._status(
+                        f"Generating {i+1}/{len(items)}  [{items[i]['emotion']}]…"
+                    ))
+                    voice_tag = re.sub(r'[^\w]', '_', voice)
+                    raw_path  = os.path.join(self._tmpdir, f"s{i}_{voice_tag}_raw.mp3")
+                    if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
+                        try:
+                            asyncio.run(_tts_async(
+                                item["text"], voice,
+                                item["rate"], item["pitch"], raw_path, item["vol"]
+                            ))
+                        except Exception as exc:
+                            self._post(lambda e=str(exc): self._status(f"TTS error: {e}"))
+                            self._post(lambda: self._raw_panel.set_error("TTS failed"))
+                            self._post(lambda: self._enh_panel.set_error("Skipped"))
+                            self._post(lambda: self._reset_play_all_btn())
+                            return
+                    raw_paths.append(raw_path)
 
             if self._play_all_stop.is_set() or not raw_paths:
                 self._post(lambda: self._status("Stopped."))
