@@ -27,6 +27,18 @@ from tkinter import ttk
 import edge_tts
 
 # ─────────────────────────────────────────────
+#  OPTIONAL: PEDALBOARD (Spotify)
+# ─────────────────────────────────────────────
+
+try:
+    from pedalboard import (Pedalboard, Compressor, Reverb,
+                            HighpassFilter, Gain, NoiseGate)
+    from pedalboard.io import AudioFile as PBAudioFile
+    PEDALBOARD_OK = True
+except ImportError:
+    PEDALBOARD_OK = False
+
+# ─────────────────────────────────────────────
 #  COLOURS
 # ─────────────────────────────────────────────
 
@@ -240,26 +252,70 @@ async def _tts_async(text: str, voice: str, rate: str, pitch: str, path: str, vo
 
 
 def enhance_file(raw: str, out: str) -> tuple[bool, str]:
-    cmd = [
-        "ffmpeg", "-y", "-i", raw,
-        "-af",
-        (
-            "equalizer=f=3000:width_type=o:width=2:g=2,"
-            "equalizer=f=200:width_type=o:width=2:g=-1.5,"
-            "acompressor=threshold=-20dB:ratio=3:attack=5:release=80:makeup=2,"
-            "loudnorm=I=-16:TP=-1.5:LRA=11"
-        ),
-        "-b:a", "192k", "-loglevel", "error", out,
-    ]
+    af = ",".join([
+        # 1. Remove sub-80 Hz rumble
+        "highpass=f=80",
+        # 2. Warmth — body/chest presence
+        "equalizer=f=300:width_type=o:width=2:g=1.5",
+        # 3. Presence — voice intelligibility
+        "equalizer=f=3000:width_type=o:width=2:g=2",
+        # 4. Cut muddiness
+        "equalizer=f=200:width_type=o:width=2:g=-1.5",
+        # 5. De-esser — tame harsh S/SH sibilance at ~7 kHz
+        "equalizer=f=7000:width_type=o:width=2:g=-2.5",
+        # 6. Air — add brilliance/openness above 10 kHz
+        "equalizer=f=10000:width_type=o:width=2:g=2",
+        # 7. Dynamic compression
+        "acompressor=threshold=-20dB:ratio=3:attack=5:release=80:makeup=2",
+        # 8. Broadcast loudness normalisation
+        "loudnorm=I=-16:TP=-1.5:LRA=11",
+    ])
+    cmd = ["ffmpeg", "-y", "-i", raw, "-af", af,
+           "-b:a", "192k", "-loglevel", "error", out]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=30)
         if r.returncode == 0:
-            return True, "Enhanced"
+            return True, "FFmpeg enhanced"
         return False, f"FFmpeg error: {r.stderr.decode()[:120]}"
     except FileNotFoundError:
         return False, "FFmpeg not found"
     except subprocess.TimeoutExpired:
         return False, "FFmpeg timed out"
+
+
+def enhance_pedalboard(input_path: str, output_path: str) -> tuple[bool, str]:
+    """Apply Spotify Pedalboard effects chain (professional-grade, pure Python)."""
+    if not PEDALBOARD_OK:
+        return False, "pedalboard not installed — run: pip install pedalboard"
+    try:
+        with PBAudioFile(input_path) as f:
+            audio = f.read(f.frames)
+            sr    = f.samplerate
+
+        board = Pedalboard([
+            # Cut sub-bass rumble
+            HighpassFilter(cutoff_frequency_hz=80),
+            # Gentle noise gate — silence gaps between words
+            NoiseGate(threshold_db=-45, ratio=1.5,
+                      attack_ms=2.0, release_ms=150.0),
+            # Smooth dynamic compression
+            Compressor(threshold_db=-18, ratio=2.5,
+                       attack_ms=5.0, release_ms=100.0),
+            # Very subtle room — removes "dry booth" feel
+            Reverb(room_size=0.08, damping=0.9,
+                   wet_level=0.04, dry_level=0.96),
+            # Final make-up gain
+            Gain(gain_db=1.5),
+        ])
+
+        processed = board(audio, sr)
+
+        with PBAudioFile(output_path, "w", sr, processed.shape[0]) as f:
+            f.write(processed)
+
+        return True, "Pedalboard enhanced"
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ─────────────────────────────────────────────
@@ -475,16 +531,15 @@ class VoiceTesterApp(tk.Tk):
         ).pack(side="left")
 
         # Badges (right-aligned)
-        ffmpeg_bg   = C["green"]  if self._ffmpeg_ok else C["yellow"]
-        ffmpeg_txt  = " FFmpeg ✓ " if self._ffmpeg_ok else " FFmpeg ✗ "
-        tk.Label(title_row, text=ffmpeg_txt,
-                 bg=ffmpeg_bg, fg=C["bg"],
-                 font=("Segoe UI", 9, "bold"),
-                 padx=4).pack(side="right", padx=(4, 0))
-        tk.Label(title_row, text=" Windows MCI ✓ ",
-                 bg=C["green"], fg=C["bg"],
-                 font=("Segoe UI", 9, "bold"),
-                 padx=4).pack(side="right", padx=(4, 0))
+        for txt, ok in [
+            (" Windows MCI ✓ ", True),
+            (" FFmpeg ✓ " if self._ffmpeg_ok else " FFmpeg ✗ ", self._ffmpeg_ok),
+            (" Pedalboard ✓ " if PEDALBOARD_OK else " Pedalboard ✗ ", PEDALBOARD_OK),
+        ]:
+            tk.Label(title_row, text=txt,
+                     bg=C["green"] if ok else C["yellow"], fg=C["bg"],
+                     font=("Segoe UI", 9, "bold"),
+                     padx=4).pack(side="right", padx=(4, 0))
 
         # Text input
         tk.Label(top, text="Text to test:", bg=C["bg"], fg=C["dim"],
@@ -534,7 +589,20 @@ class VoiceTesterApp(tk.Tk):
             selectcolor=C["surface2"],
             activebackground=C["bg"], activeforeground=C["text"],
             font=("Segoe UI", 10),
-        ).pack(side="left", padx=(0, 12))
+        ).pack(side="left", padx=(0, 6))
+
+        # Pedalboard toggle
+        self._pb_var = tk.BooleanVar(value=PEDALBOARD_OK)
+        pb_cb = tk.Checkbutton(
+            ctrl, text="Pedalboard",
+            variable=self._pb_var,
+            bg=C["bg"], fg=C["text"] if PEDALBOARD_OK else C["dim"],
+            selectcolor=C["surface2"],
+            activebackground=C["bg"], activeforeground=C["text"],
+            font=("Segoe UI", 10),
+            state="normal" if PEDALBOARD_OK else "disabled",
+        )
+        pb_cb.pack(side="left", padx=(0, 12))
 
         tk.Button(
             ctrl, text="  Parse  [Ctrl+Enter]  ",
@@ -727,7 +795,16 @@ class VoiceTesterApp(tk.Tk):
             self._post(lambda: self._enh_panel.set_loading("Enhancing with FFmpeg…"))
             ok, msg = enhance_file(raw_path, enh_path)
             if ok:
-                enh_label = f"enhanced  ·  {raw_label}"
+                # Optional Pedalboard stage on top of FFmpeg
+                use_pb = self._pb_var.get() and PEDALBOARD_OK
+                if use_pb:
+                    self._post(lambda: self._enh_panel.set_loading("Pedalboard pass…"))
+                    pb_path = enh_path + ".pb.mp3"
+                    pb_ok, _ = enhance_pedalboard(enh_path, pb_path)
+                    if pb_ok:
+                        os.replace(pb_path, enh_path)
+                        msg = "FFmpeg + Pedalboard"
+                enh_label = f"{msg}  ·  {raw_label}"
                 self._post(lambda: self._enh_panel.set_ready_and_play(enh_path, enh_label))
                 self._post(lambda: self._status(f"Item {idx + 1} ready."))
             else:
@@ -831,18 +908,30 @@ class VoiceTesterApp(tk.Tk):
 
             # ── Phase 3: enhance combined raw ───────────────────
             enh_ok = False
+            enh_label_tag = "enhanced"
             if ffmpeg and raw_ok and not self._play_all_stop.is_set():
                 self._post(lambda: self._enh_panel.set_loading("Enhancing full audio…"))
                 self._post(lambda: self._status("Enhancing with FFmpeg…"))
                 ok, msg = enhance_file(all_raw, all_enh)
                 enh_ok = ok
-                if not ok:
+                if ok:
+                    enh_label_tag = "FFmpeg"
+                    use_pb = self._pb_var.get() and PEDALBOARD_OK
+                    if use_pb:
+                        self._post(lambda: self._enh_panel.set_loading("Pedalboard pass…"))
+                        self._post(lambda: self._status("Applying Pedalboard…"))
+                        pb_path = all_enh + ".pb.mp3"
+                        pb_ok, _ = enhance_pedalboard(all_enh, pb_path)
+                        if pb_ok:
+                            os.replace(pb_path, all_enh)
+                            enh_label_tag = "FFmpeg + Pedalboard"
+                else:
                     self._post(lambda m=msg: self._enh_panel.set_error(m))
 
             # ── Phase 4: load both panels ────────────────────────
             n = len(raw_paths)
             raw_label = f"all {n} paragraph(s) · raw"
-            enh_label = f"all {n} paragraph(s) · enhanced"
+            enh_label = f"all {n} paragraph(s) · {enh_label_tag}"
 
             if raw_ok:
                 self._post(lambda: self._raw_panel.set_ready(all_raw, raw_label))
