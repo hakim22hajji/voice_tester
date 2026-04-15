@@ -795,7 +795,9 @@ class VoiceTesterApp(tk.Tk):
                 self._post(lambda i=i: self._status(
                     f"Generating {i+1}/{len(items)}  [{items[i]['emotion']}]…"
                 ))
-                raw_path = os.path.join(self._tmpdir, f"s{i}_raw.mp3")
+                # Include voice name in filename so changing voice invalidates cache
+                voice_tag = re.sub(r'[^\w]', '_', voice)
+                raw_path = os.path.join(self._tmpdir, f"s{i}_{voice_tag}_raw.mp3")
                 if not (os.path.exists(raw_path) and os.path.getsize(raw_path) > 0):
                     try:
                         asyncio.run(_tts_async(
@@ -849,19 +851,16 @@ class VoiceTesterApp(tk.Tk):
 
             # ── Phase 5: play ────────────────────────────────────
             if raw_ok:
-                # Both panels ready — play raw, user can click enhanced panel to compare
-                self._post(lambda: self._raw_panel.play())
-                self._post(lambda: self._status("Playing full text (raw). Click Enhanced panel to compare."))
-                # Wait for raw to finish (poll from worker thread via MCI directly)
-                raw_player = AudioPlayer()
-                ok, _ = raw_player.play(all_raw)
-                if ok:
-                    while raw_player.is_playing() and not self._play_all_stop.is_set():
-                        time.sleep(0.15)
-                raw_player.stop()
+                # Panels are loaded — auto-play raw. User clicks Enhanced ▶ to compare.
+                # Use the panel's own player (set_ready_and_play) — no second player here.
+                self._post(lambda: self._raw_panel.set_ready_and_play(all_raw, raw_label))
+                self._post(lambda: self._status(
+                    "Playing full text (raw). Click ▶ Play in the Enhanced panel to compare."
+                ))
             else:
-                # No FFmpeg — sequential playback in raw panel
-                self._post(lambda: self._status("Playing all (sequential, no FFmpeg for combining)…"))
+                # No FFmpeg — sequential playback using a dedicated player
+                # (keeps panel player free for the Stop button)
+                self._post(lambda: self._status("Playing all paragraphs sequentially…"))
                 seq_player = AudioPlayer()
                 for i, path in enumerate(raw_paths):
                     if self._play_all_stop.is_set():
@@ -875,9 +874,6 @@ class VoiceTesterApp(tk.Tk):
                         while seq_player.is_playing() and not self._play_all_stop.is_set():
                             time.sleep(0.15)
                 seq_player.stop()
-                self._post(lambda: self._raw_panel.set_ready(
-                    raw_paths[-1], f"last of {n} paragraphs · raw"
-                ))
 
             self._post(lambda: self._status(
                 "Stopped." if self._play_all_stop.is_set() else
